@@ -1,5 +1,7 @@
 import os
+import time
 from datetime import datetime, timedelta
+import pandas as pd
 import requests
 import jquantsapi
 
@@ -17,17 +19,34 @@ def get_client():
     return jquantsapi.ClientV2(api_key=API_KEY)
 
 
+def fetch_fin_summary_window(client, end_dt, days=30):
+    """指定期間のfin_summaryをレート制限に配慮して1日ずつ順次取得"""
+    frames = []
+    for i in range(days, -1, -1):
+        dt = end_dt - timedelta(days=i)
+        if dt.weekday() >= 5:  # 土日スキップ
+            continue
+        try:
+            df = client.get_fin_summary(date_yyyymmdd=dt.strftime("%Y%m%d"))
+            if df is not None and not df.empty:
+                frames.append(df)
+        except Exception:
+            pass
+        time.sleep(0.5)
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
 def screen(client):
-    # 無料プランは約90日遅延。30日ウィンドウで最新の全銘柄データを取得
+    # 無料プランは約90日遅延
     end_dt = datetime.now() - timedelta(days=90)
-    start_dt = end_dt - timedelta(days=30)
     year_ago_end = end_dt - timedelta(days=365)
-    year_ago_start = year_ago_end - timedelta(days=30)
 
-    fins_now = client.get_fin_summary_range(start_dt=start_dt, end_dt=end_dt)
-    fins_prev = client.get_fin_summary_range(start_dt=year_ago_start, end_dt=year_ago_end)
+    fins_now = fetch_fin_summary_window(client, end_dt, days=30)
+    fins_prev = fetch_fin_summary_window(client, year_ago_end, days=30)
 
-    # 銘柄ごとの最新レコードを使用
+    if fins_now.empty:
+        raise RuntimeError("財務サマリーを取得できませんでした")
+
     fins_now = fins_now.sort_values("DisclosedDate").groupby("Code").last().reset_index()
     fins_prev = fins_prev.sort_values("DisclosedDate").groupby("Code").last().reset_index()
 
@@ -52,7 +71,7 @@ def screen(client):
         (df["OperatingProfit_now"] - df["OperatingProfit_prev"]) / df["OperatingProfit_prev"].abs() * 100
     )
 
-    # 株価取得（財務データと同じ期間）
+    # 株価取得（財務データと同じ期間末の直近7日）
     prices = client.get_eq_bars_daily_range(
         start_dt=end_dt - timedelta(days=7), end_dt=end_dt
     )
@@ -61,7 +80,6 @@ def screen(client):
 
     df = df.merge(prices_latest, on="Code", how="left")
 
-    # PER = 株価/EPS, PBR = 株価/BPS, ROE = EPS/BPS * 100
     df["PER_calc"] = df["Price"] / df["EarningsPerShare"]
     df["PBR_calc"] = df["Price"] / df["BookValuePerShare"]
     df["ROE_calc"] = df["EarningsPerShare"] / df["BookValuePerShare"] * 100
