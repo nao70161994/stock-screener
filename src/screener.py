@@ -41,11 +41,13 @@ def screen(client):
     end_dt = datetime.now() - timedelta(days=90)
     year_ago_end = end_dt - timedelta(days=365)
 
-    fins_now = fetch_fin_summary_window(client, end_dt, days=30)
-    fins_prev = fetch_fin_summary_window(client, year_ago_end, days=30)
+    fins_now = fetch_fin_summary_window(client, end_dt, days=60)
+    fins_prev = fetch_fin_summary_window(client, year_ago_end, days=60)
 
     if fins_now.empty:
         raise RuntimeError("財務サマリーを取得できませんでした")
+    if fins_prev.empty:
+        raise RuntimeError("前年同期の財務サマリーを取得できませんでした")
 
     # V2カラム名: DiscDate, Sales, OP, EPS, BPS
     fins_now = fins_now.sort_values("DiscDate").groupby("Code").last().reset_index()
