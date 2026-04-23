@@ -17,36 +17,45 @@ def get_client():
     return jquantsapi.ClientV2(api_key=API_KEY)
 
 
-def calc_growth(df, col):
-    df = df.sort_values(["Code", "DisclosedDate"])
-    df[f"{col}_prev"] = df.groupby("Code")[col].shift(4)
-    df[f"{col}_growth"] = (df[col] - df[f"{col}_prev"]) / df[f"{col}_prev"].abs() * 100
-    return df
-
-
 def screen(client):
     end_dt = datetime.now()
-    start_dt = end_dt - timedelta(days=730)  # 2年分（前年比成長率計算用）
+    year_ago = end_dt - timedelta(days=365)
 
-    fins = client.get_fin_summary_range(start_dt=start_dt, end_dt=end_dt)
-    fins = fins.sort_values(["Code", "DisclosedDate"])
+    # 最新と1年前の財務サマリーを各1回取得（429対策）
+    fins_now = client.get_fin_summary(date=end_dt.strftime("%Y%m%d"))
+    fins_prev = client.get_fin_summary(date=year_ago.strftime("%Y%m%d"))
 
-    # 成長率計算
-    fins = calc_growth(fins, "NetSales")
-    fins = calc_growth(fins, "OperatingProfit")
+    fins_now = fins_now.rename(columns={
+        "NetSales": "NetSales_now",
+        "OperatingProfit": "OperatingProfit_now",
+    })
+    fins_prev = fins_prev.rename(columns={
+        "NetSales": "NetSales_prev",
+        "OperatingProfit": "OperatingProfit_prev",
+    })
 
-    # 最新レコードのみ
-    latest = fins.groupby("Code").last().reset_index()
+    df = fins_now.merge(
+        fins_prev[["Code", "NetSales_prev", "OperatingProfit_prev"]],
+        on="Code", how="left"
+    )
 
-    # 株価取得（直近1日）
-    prices = client.get_eq_bars_daily_range(start_dt=end_dt - timedelta(days=7), end_dt=end_dt)
+    df["NetSales_growth"] = (
+        (df["NetSales_now"] - df["NetSales_prev"]) / df["NetSales_prev"].abs() * 100
+    )
+    df["OperatingProfit_growth"] = (
+        (df["OperatingProfit_now"] - df["OperatingProfit_prev"]) / df["OperatingProfit_prev"].abs() * 100
+    )
+
+    # 株価取得（直近7日で最新終値）
+    prices = client.get_eq_bars_daily_range(
+        start_dt=end_dt - timedelta(days=7), end_dt=end_dt
+    )
     prices_latest = prices.sort_values("Date").groupby("Code").last().reset_index()
-    prices_latest = prices_latest[["Code", "C"]]  # V2では終値カラムが"C"
-    prices_latest = prices_latest.rename(columns={"C": "Price"})
+    prices_latest = prices_latest[["Code", "C"]].rename(columns={"C": "Price"})
 
-    df = latest.merge(prices_latest, on="Code", how="left")
+    df = df.merge(prices_latest, on="Code", how="left")
 
-    # PER = 株価 / EPS, PBR = 株価 / BPS, ROE = EPS / BPS * 100
+    # PER = 株価/EPS, PBR = 株価/BPS, ROE = EPS/BPS * 100
     df["PER_calc"] = df["Price"] / df["EarningsPerShare"]
     df["PBR_calc"] = df["Price"] / df["BookValuePerShare"]
     df["ROE_calc"] = df["EarningsPerShare"] / df["BookValuePerShare"] * 100
