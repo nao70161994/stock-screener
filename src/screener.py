@@ -1,5 +1,4 @@
 import os
-import time
 from datetime import datetime, timedelta
 import pandas as pd
 import requests
@@ -19,64 +18,35 @@ def get_client():
     return jquantsapi.ClientV2(api_key=API_KEY)
 
 
-def fetch_fin_summary_window(client, end_dt, days=30):
-    """指定期間のfin_summaryをレート制限に配慮して順次取得"""
-    frames = []
-    for i in range(days, -1, -1):
-        dt = end_dt - timedelta(days=i)
-        if dt.weekday() >= 5:
-            continue
-        try:
-            df = client.get_fin_summary(date_yyyymmdd=dt.strftime("%Y%m%d"))
-            if df is not None and not df.empty:
-                frames.append(df)
-        except Exception as e:
-            print(f"  {dt.strftime('%Y%m%d')}: {e}")
-        time.sleep(0.5)
-    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-
-
 def screen(client):
-    # 無料プランは約90日遅延
-    end_dt = datetime.now() - timedelta(days=90)
-    year_ago_end = end_dt - timedelta(days=365)
+    # パラメータなしで全銘柄の最新財務サマリーを取得（1回のAPI呼び出し）
+    fins = client.get_fin_summary()
+    print(f"取得件数: {len(fins)}, カラム: {fins.columns.tolist()[:10]}")
 
-    fins_now = fetch_fin_summary_window(client, end_dt, days=60)
-    fins_prev = fetch_fin_summary_window(client, year_ago_end, days=60)
-
-    if fins_now.empty:
+    if fins.empty:
         raise RuntimeError("財務サマリーを取得できませんでした")
-    if fins_prev.empty:
-        raise RuntimeError("前年同期の財務サマリーを取得できませんでした")
 
-    # V2カラム名: DiscDate, Sales, OP, EPS, BPS
-    fins_now = fins_now.sort_values("DiscDate").groupby("Code").last().reset_index()
-    fins_prev = fins_prev.sort_values("DiscDate").groupby("Code").last().reset_index()
-
-    fins_now = fins_now.rename(columns={"Sales": "Sales_now", "OP": "OP_now"})
-    fins_prev = fins_prev.rename(columns={"Sales": "Sales_prev", "OP": "OP_prev"})
-
-    df = fins_now.merge(
-        fins_prev[["Code", "Sales_prev", "OP_prev"]],
-        on="Code", how="left"
-    )
-
-    df["Sales_growth"] = (df["Sales_now"] - df["Sales_prev"]) / df["Sales_prev"].abs() * 100
-    df["OP_growth"] = (df["OP_now"] - df["OP_prev"]) / df["OP_prev"].abs() * 100
+    # 銘柄ごとの最新レコード
+    fins = fins.sort_values("DiscDate").groupby("Code").last().reset_index()
 
     # 株価取得（直近7日）
+    end_dt = datetime.now() - timedelta(days=90)  # 無料プランの遅延を考慮
     prices = client.get_eq_bars_daily_range(
         start_dt=end_dt - timedelta(days=7), end_dt=end_dt
     )
     prices_latest = prices.sort_values("Date").groupby("Code").last().reset_index()
     prices_latest = prices_latest[["Code", "C"]].rename(columns={"C": "Price"})
 
-    df = df.merge(prices_latest, on="Code", how="left")
+    df = fins.merge(prices_latest, on="Code", how="left")
 
     # PER = 株価/EPS, PBR = 株価/BPS, ROE = EPS/BPS * 100
     df["PER"] = df["Price"] / df["EPS"]
     df["PBR"] = df["Price"] / df["BPS"]
     df["ROE"] = df["EPS"] / df["BPS"] * 100
+
+    # 成長率はFSales/FOP（会社予想）で代替（無料プランでは前年実績が取りにくいため）
+    df["Sales_growth"] = (df["FSales"] - df["Sales"]) / df["Sales"].abs() * 100
+    df["OP_growth"] = (df["FOP"] - df["OP"]) / df["OP"].abs() * 100
 
     result = df[
         (df["PER"].notna()) & (df["PER"] > 0) & (df["PER"] <= PER_MAX) &
