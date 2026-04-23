@@ -47,6 +47,8 @@ def screen(client):
     if fins_now.empty:
         raise RuntimeError("財務サマリーを取得できませんでした")
 
+    print("columns:", fins_now.columns.tolist())
+
     fins_now = fins_now.sort_values("DisclosedDate").groupby("Code").last().reset_index()
     fins_prev = fins_prev.sort_values("DisclosedDate").groupby("Code").last().reset_index()
 
