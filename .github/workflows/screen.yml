@@ -21,7 +21,6 @@ jobs:
 
       - name: Run screener
         env:
-          JQUANTS_EMAIL: ${{ secrets.JQUANTS_EMAIL }}
-          JQUANTS_PASSWORD: ${{ secrets.JQUANTS_PASSWORD }}
+          JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
         run: python src/screener.py

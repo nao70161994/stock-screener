@@ -1,10 +1,10 @@
 import os
+from datetime import datetime, timedelta
 import requests
 import jquantsapi
 
 NTFY_TOPIC = os.environ["NTFY_TOPIC"]
-EMAIL = os.environ["JQUANTS_EMAIL"]
-PASSWORD = os.environ["JQUANTS_PASSWORD"]
+API_KEY = os.environ["JQUANTS_API_KEY"]
 
 PER_MAX = 20.0
 PBR_MAX = 3.0
@@ -14,56 +14,52 @@ OP_PROFIT_GROWTH_MIN = 10.0
 
 
 def get_client():
-    return jquantsapi.Client(mail_address=EMAIL, password=PASSWORD)
-
-
-def fetch_indicators(client):
-    """全銘柄の財務指標を取得"""
-    df = client.get_fins_statements_all()
-    return df
+    return jquantsapi.ClientV2(api_key=API_KEY)
 
 
 def calc_growth(df, col):
-    """前年同期比成長率(%)を計算してカラム追加"""
     df = df.sort_values(["Code", "DisclosedDate"])
-    df[f"{col}_prev"] = df.groupby("Code")[col].shift(4)  # 四半期ベースで1年前
+    df[f"{col}_prev"] = df.groupby("Code")[col].shift(4)
     df[f"{col}_growth"] = (df[col] - df[f"{col}_prev"]) / df[f"{col}_prev"].abs() * 100
     return df
 
 
 def screen(client):
-    # 財務サマリー（PER・PBR・ROE）
-    fins = client.get_fins_statements_all()
-    fins = fins.sort_values(["Code", "DisclosedDate"])
-    latest = fins.groupby("Code").last().reset_index()
+    end_dt = datetime.now()
+    start_dt = end_dt - timedelta(days=730)  # 2年分（前年比成長率計算用）
 
-    # 売上・営業利益の成長率計算
+    fins = client.get_fin_summary_range(start_dt=start_dt, end_dt=end_dt)
+    fins = fins.sort_values(["Code", "DisclosedDate"])
+
+    # 成長率計算
     fins = calc_growth(fins, "NetSales")
     fins = calc_growth(fins, "OperatingProfit")
-    growth = fins.groupby("Code").last()[["NetSales_growth", "OperatingProfit_growth"]].reset_index()
 
-    df = latest.merge(growth, on="Code", how="left")
+    # 最新レコードのみ
+    latest = fins.groupby("Code").last().reset_index()
 
-    # 株価指標（PER・PBR・ROE）はfins_statementsには含まれないためprices_daily_quotesから取得
-    prices = client.get_prices_daily_quotes_all()
+    # 株価取得（直近1日）
+    prices = client.get_eq_bars_daily_range(start_dt=end_dt - timedelta(days=7), end_dt=end_dt)
     prices_latest = prices.sort_values("Date").groupby("Code").last().reset_index()
-    prices_latest = prices_latest[["Code", "PER", "PBR"]]
+    prices_latest = prices_latest[["Code", "C"]]  # V2では終値カラムが"C"
+    prices_latest = prices_latest.rename(columns={"C": "Price"})
 
-    df = df.merge(prices_latest, on="Code", how="left")
+    df = latest.merge(prices_latest, on="Code", how="left")
 
-    # ROEはfinsから計算（純利益/純資産）
-    df["ROE_calc"] = df["NetIncome"] / df["NetAssets"] * 100
+    # PER = 株価 / EPS, PBR = 株価 / BPS, ROE = EPS / BPS * 100
+    df["PER_calc"] = df["Price"] / df["EarningsPerShare"]
+    df["PBR_calc"] = df["Price"] / df["BookValuePerShare"]
+    df["ROE_calc"] = df["EarningsPerShare"] / df["BookValuePerShare"] * 100
 
-    # スクリーニング
     result = df[
-        (df["PER"].notna()) & (df["PER"] <= PER_MAX) &
-        (df["PBR"].notna()) & (df["PBR"] <= PBR_MAX) &
+        (df["PER_calc"].notna()) & (df["PER_calc"] > 0) & (df["PER_calc"] <= PER_MAX) &
+        (df["PBR_calc"].notna()) & (df["PBR_calc"] > 0) & (df["PBR_calc"] <= PBR_MAX) &
         (df["ROE_calc"].notna()) & (df["ROE_calc"] >= ROE_MIN) &
         (df["NetSales_growth"].notna()) & (df["NetSales_growth"] >= SALES_GROWTH_MIN) &
         (df["OperatingProfit_growth"].notna()) & (df["OperatingProfit_growth"] >= OP_PROFIT_GROWTH_MIN)
     ]
 
-    return result[["Code", "CompanyName", "PER", "PBR", "ROE_calc",
+    return result[["Code", "CompanyName", "PER_calc", "PBR_calc", "ROE_calc",
                     "NetSales_growth", "OperatingProfit_growth"]].reset_index(drop=True)
 
 
@@ -75,7 +71,7 @@ def notify(df):
         for _, row in df.iterrows():
             lines.append(
                 f"{row['Code']} {row['CompanyName']}\n"
-                f"  PER:{row['PER']:.1f} PBR:{row['PBR']:.2f} "
+                f"  PER:{row['PER_calc']:.1f} PBR:{row['PBR_calc']:.2f} "
                 f"ROE:{row['ROE_calc']:.1f}% "
                 f"売上成長:{row['NetSales_growth']:.1f}% "
                 f"営業利益成長:{row['OperatingProfit_growth']:.1f}%"
