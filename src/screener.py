@@ -17,12 +17,24 @@ def get_client():
     return jquantsapi.ClientV2(api_key=API_KEY)
 
 
-def screen(client):
-    end_dt = datetime.now()
-    year_ago = end_dt - timedelta(days=365)
+def _get_fin_summary_latest(client):
+    """利用可能な最新日付のfin_summaryを返す（無料プランは約3ヶ月遅延）"""
+    for days_back in range(0, 180, 7):
+        dt = datetime.now() - timedelta(days=days_back)
+        try:
+            df = client.get_fin_summary(date_yyyymmdd=dt.strftime("%Y%m%d"))
+            if df is not None and not df.empty:
+                return df, dt
+        except Exception:
+            pass
+    raise RuntimeError("利用可能な財務サマリーが見つかりません")
 
-    # 最新と1年前の財務サマリーを各1回取得（429対策）
-    fins_now = client.get_fin_summary(date_yyyymmdd=end_dt.strftime("%Y%m%d"))
+
+def screen(client):
+    fins_now, latest_dt = _get_fin_summary_latest(client)
+    year_ago = latest_dt - timedelta(days=365)
+
+    # 1年前のデータも同様に取得
     fins_prev = client.get_fin_summary(date_yyyymmdd=year_ago.strftime("%Y%m%d"))
 
     fins_now = fins_now.rename(columns={
@@ -46,9 +58,9 @@ def screen(client):
         (df["OperatingProfit_now"] - df["OperatingProfit_prev"]) / df["OperatingProfit_prev"].abs() * 100
     )
 
-    # 株価取得（直近7日で最新終値）
+    # 株価取得（最新利用可能日付の前後7日）
     prices = client.get_eq_bars_daily_range(
-        start_dt=end_dt - timedelta(days=7), end_dt=end_dt
+        start_dt=latest_dt - timedelta(days=7), end_dt=latest_dt
     )
     prices_latest = prices.sort_values("Date").groupby("Code").last().reset_index()
     prices_latest = prices_latest[["Code", "C"]].rename(columns={"C": "Price"})
