@@ -22,8 +22,8 @@ def screen(client):
     year_ago = end_dt - timedelta(days=365)
 
     # 最新と1年前の財務サマリーを各1回取得（429対策）
-    fins_now = client.get_fin_summary(date=end_dt.strftime("%Y%m%d"))
-    fins_prev = client.get_fin_summary(date=year_ago.strftime("%Y%m%d"))
+    fins_now = client.get_fin_summary(date_yyyymmdd=end_dt.strftime("%Y%m%d"))
+    fins_prev = client.get_fin_summary(date_yyyymmdd=year_ago.strftime("%Y%m%d"))
 
     fins_now = fins_now.rename(columns={
         "NetSales": "NetSales_now",
