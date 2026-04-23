@@ -30,8 +30,8 @@ def fetch_fin_summary_window(client, end_dt, days=30):
             df = client.get_fin_summary(date_yyyymmdd=dt.strftime("%Y%m%d"))
             if df is not None and not df.empty:
                 frames.append(df)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"  {dt.strftime('%Y%m%d')}: {e}")
         time.sleep(0.5)
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
