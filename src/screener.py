@@ -92,11 +92,23 @@ def screen():
     df["Sales_growth"] = (df["Sales_now"] - df["Sales_prev"]) / df["Sales_prev"].abs() * 100
     df["OP_growth"] = (df["OP_now"] - df["OP_prev"]) / df["OP_prev"].abs() * 100
 
-    # 株価取得（直近7日）
+    # 株価取得：最後に成功した日付から直近の営業日を探す
     print("=== 株価取得 ===")
-    prices_df = jquants_get("/equities/bars/daily", {
-        "date": end_dt.strftime("%Y%m%d")
-    })
+    prices_df = pd.DataFrame()
+    for i in range(0, 30):
+        dt = end_dt - timedelta(days=i)
+        if dt.weekday() >= 5:
+            continue
+        try:
+            tmp = jquants_get("/equities/bars/daily", {"date": dt.strftime("%Y%m%d")})
+            if not tmp.empty:
+                prices_df = tmp
+                print(f"  株価取得日: {dt.strftime('%Y%m%d')} ({len(prices_df)}件)")
+                break
+            print(f"  {dt.strftime('%Y%m%d')}: 空レスポンス")
+        except Exception as e:
+            print(f"  {dt.strftime('%Y%m%d')}: {e}")
+        time.sleep(RATE_LIMIT_SLEEP)
     if prices_df.empty:
         raise RuntimeError("株価データを取得できませんでした")
 
