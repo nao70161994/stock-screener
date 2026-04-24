@@ -74,6 +74,10 @@ def screen():
     if fins_now.empty:
         raise RuntimeError("財務サマリーを取得できませんでした")
 
+    for col in ["Sales", "OP", "EPS", "BPS"]:
+        fins_now[col] = pd.to_numeric(fins_now[col], errors="coerce")
+        fins_prev[col] = pd.to_numeric(fins_prev[col], errors="coerce")
+
     fins_now = fins_now.sort_values("DiscDate").groupby("Code").last().reset_index()
     fins_prev = fins_prev.sort_values("DiscDate").groupby("Code").last().reset_index()
 
@@ -97,6 +101,7 @@ def screen():
         raise RuntimeError("株価データを取得できませんでした")
 
     prices_df = prices_df.rename(columns={"C": "Price"})
+    prices_df["Price"] = pd.to_numeric(prices_df["Price"], errors="coerce")
 
     df = df.merge(prices_df[["Code", "Price"]], on="Code", how="left")
 
