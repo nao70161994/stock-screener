@@ -43,7 +43,7 @@ def jquants_get(path, params=None):
 def fetch_fin_summary_window(end_dt, days=30):
     """指定期間のfin_summaryを取得（レート制限準拠）"""
     frames = []
-    for i in range(days, -1, -1):
+    for i in range(days, 0, -1):
         dt = end_dt - timedelta(days=i)
         if dt.weekday() >= 5:
             continue
@@ -76,7 +76,8 @@ def screen():
 
     for col in ["Sales", "OP", "EPS", "BPS"]:
         fins_now[col] = pd.to_numeric(fins_now[col], errors="coerce")
-        fins_prev[col] = pd.to_numeric(fins_prev[col], errors="coerce")
+        if not fins_prev.empty:
+            fins_prev[col] = pd.to_numeric(fins_prev[col], errors="coerce")
 
     fins_now = fins_now.sort_values("DiscDate").groupby("Code").last().reset_index()
     fins_prev = fins_prev.sort_values("DiscDate").groupby("Code").last().reset_index()
@@ -119,6 +120,7 @@ def screen():
 
     # 会社名取得
     print("=== 会社情報取得 ===")
+    time.sleep(RATE_LIMIT_SLEEP)
     info_df = jquants_get("/listed/info")
     if not info_df.empty:
         name_col = next((c for c in info_df.columns if "Name" in c and "English" not in c), None)

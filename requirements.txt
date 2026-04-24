@@ -1,2 +1,2 @@
-jquants-api-client
+pandas
 requests
