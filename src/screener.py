@@ -117,6 +117,18 @@ def screen():
 
     df = df.merge(prices_df[["Code", "Price"]], on="Code", how="left")
 
+    # 会社名取得
+    print("=== 会社情報取得 ===")
+    info_df = jquants_get("/listed/info")
+    if not info_df.empty:
+        name_col = next((c for c in info_df.columns if "Name" in c and "English" not in c), None)
+        if name_col:
+            df = df.merge(info_df[["Code", name_col]].rename(columns={name_col: "CompanyName"}), on="Code", how="left")
+        else:
+            df["CompanyName"] = ""
+    else:
+        df["CompanyName"] = ""
+
     df["PER"] = df["Price"] / df["EPS"]
     df["PBR"] = df["Price"] / df["BPS"]
     df["ROE"] = df["EPS"] / df["BPS"] * 100
@@ -129,7 +141,7 @@ def screen():
         (df["OP_growth"].notna()) & (df["OP_growth"] >= OP_PROFIT_GROWTH_MIN)
     ]
 
-    return result[["Code", "PER", "PBR", "ROE", "Sales_growth", "OP_growth"]].reset_index(drop=True)
+    return result[["Code", "CompanyName", "Price", "PER", "PBR", "ROE", "Sales_growth", "OP_growth"]].reset_index(drop=True)
 
 
 def notify(df):
@@ -139,7 +151,7 @@ def notify(df):
         lines = [f"【割安成長株スクリーニング】{len(df)}銘柄\n"]
         for _, row in df.iterrows():
             lines.append(
-                f"{row['Code']}\n"
+                f"{row['Code']} {row['CompanyName']} ¥{row['Price']:,.0f}\n"
                 f"  PER:{row['PER']:.1f} PBR:{row['PBR']:.2f} "
                 f"ROE:{row['ROE']:.1f}% "
                 f"売上成長:{row['Sales_growth']:.1f}% "
