@@ -52,7 +52,7 @@ def fetch_fin_summary_window(end_dt, days=30):
             if not df.empty:
                 frames.append(df)
                 print(f"  {dt.strftime('%Y%m%d')}: {len(df)}件")
-        except requests.HTTPError as e:
+        except Exception as e:
             print(f"  {dt.strftime('%Y%m%d')}: {e}")
         time.sleep(RATE_LIMIT_SLEEP)
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
@@ -80,7 +80,8 @@ def screen():
             fins_prev[col] = pd.to_numeric(fins_prev[col], errors="coerce")
 
     fins_now = fins_now.sort_values("DiscDate").groupby("Code").last().reset_index()
-    fins_prev = fins_prev.sort_values("DiscDate").groupby("Code").last().reset_index()
+    if not fins_prev.empty:
+        fins_prev = fins_prev.sort_values("DiscDate").groupby("Code").last().reset_index()
 
     fins_now = fins_now.rename(columns={"Sales": "Sales_now", "OP": "OP_now"})
     fins_prev = fins_prev.rename(columns={"Sales": "Sales_prev", "OP": "OP_prev"})
@@ -109,7 +110,7 @@ def screen():
             print(f"  {dt.strftime('%Y%m%d')}: 空レスポンス")
         except Exception as e:
             print(f"  {dt.strftime('%Y%m%d')}: {e}")
-        time.sleep(RATE_LIMIT_SLEEP)
+        time.sleep(RATE_LIMIT_SLEEP)  # breakした場合はここに来ない
     if prices_df.empty:
         raise RuntimeError("株価データを取得できませんでした")
 
