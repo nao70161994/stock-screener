@@ -1,11 +1,13 @@
 import os
+import time
 from datetime import datetime, timedelta
 import pandas as pd
 import requests
-import jquantsapi
 
 NTFY_TOPIC = os.environ["NTFY_TOPIC"]
 API_KEY = os.environ["JQUANTS_API_KEY"]
+BASE_URL = "https://api.jquants.com/v2"
+HEADERS = {"x-api-key": API_KEY}
 
 PER_MAX = 20.0
 PBR_MAX = 3.0
@@ -13,40 +15,94 @@ ROE_MIN = 10.0
 SALES_GROWTH_MIN = 10.0
 OP_PROFIT_GROWTH_MIN = 10.0
 
-
-def get_client():
-    return jquantsapi.ClientV2(api_key=API_KEY)
+RATE_LIMIT_SLEEP = 13  # 5 req/min = 12s間隔、余裕を持って13s
 
 
-def screen(client):
-    # パラメータなしで全銘柄の最新財務サマリーを取得（1回のAPI呼び出し）
-    fins = client.get_fin_summary()
-    print(f"取得件数: {len(fins)}, カラム: {fins.columns.tolist()[:10]}")
+def jquants_get(path, params=None):
+    """J-Quants API へのGETリクエスト（ページネーション対応）"""
+    frames = []
+    while True:
+        resp = requests.get(f"{BASE_URL}{path}", headers=HEADERS, params=params, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
 
-    if fins.empty:
+        key = next((k for k in data if isinstance(data[k], list)), None)
+        if key is None:
+            break
+        frames.append(pd.DataFrame(data[key]))
+
+        pagination_key = data.get("pagination_key")
+        if not pagination_key:
+            break
+        params = {**(params or {}), "pagination_key": pagination_key}
+        time.sleep(RATE_LIMIT_SLEEP)
+
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
+def fetch_fin_summary_window(end_dt, days=30):
+    """指定期間のfin_summaryを取得（レート制限準拠）"""
+    frames = []
+    for i in range(days, -1, -1):
+        dt = end_dt - timedelta(days=i)
+        if dt.weekday() >= 5:
+            continue
+        try:
+            df = jquants_get("/fins/summary", {"date": dt.strftime("%Y%m%d")})
+            if not df.empty:
+                frames.append(df)
+                print(f"  {dt.strftime('%Y%m%d')}: {len(df)}件")
+        except requests.HTTPError as e:
+            print(f"  {dt.strftime('%Y%m%d')}: {e}")
+        time.sleep(RATE_LIMIT_SLEEP)
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
+def screen():
+    # 無料プランは約90日遅延
+    end_dt = datetime.now() - timedelta(days=90)
+    year_ago_end = end_dt - timedelta(days=365)
+
+    print("=== 現在期間の財務サマリー取得 ===")
+    fins_now = fetch_fin_summary_window(end_dt, days=30)
+    print(f"現在期間: {len(fins_now)}件")
+
+    print("=== 前年同期の財務サマリー取得 ===")
+    fins_prev = fetch_fin_summary_window(year_ago_end, days=30)
+    print(f"前年同期: {len(fins_prev)}件")
+
+    if fins_now.empty:
         raise RuntimeError("財務サマリーを取得できませんでした")
 
-    # 銘柄ごとの最新レコード
-    fins = fins.sort_values("DiscDate").groupby("Code").last().reset_index()
+    fins_now = fins_now.sort_values("DiscDate").groupby("Code").last().reset_index()
+    fins_prev = fins_prev.sort_values("DiscDate").groupby("Code").last().reset_index()
+
+    fins_now = fins_now.rename(columns={"Sales": "Sales_now", "OP": "OP_now"})
+    fins_prev = fins_prev.rename(columns={"Sales": "Sales_prev", "OP": "OP_prev"})
+
+    df = fins_now.merge(
+        fins_prev[["Code", "Sales_prev", "OP_prev"]],
+        on="Code", how="left"
+    )
+
+    df["Sales_growth"] = (df["Sales_now"] - df["Sales_prev"]) / df["Sales_prev"].abs() * 100
+    df["OP_growth"] = (df["OP_now"] - df["OP_prev"]) / df["OP_prev"].abs() * 100
 
     # 株価取得（直近7日）
-    end_dt = datetime.now() - timedelta(days=90)  # 無料プランの遅延を考慮
-    prices = client.get_eq_bars_daily_range(
-        start_dt=end_dt - timedelta(days=7), end_dt=end_dt
-    )
-    prices_latest = prices.sort_values("Date").groupby("Code").last().reset_index()
-    prices_latest = prices_latest[["Code", "C"]].rename(columns={"C": "Price"})
+    print("=== 株価取得 ===")
+    prices_df = jquants_get("/equities/bars/daily", {
+        "date": end_dt.strftime("%Y%m%d")
+    })
+    if prices_df.empty:
+        raise RuntimeError("株価データを取得できませんでした")
 
-    df = fins.merge(prices_latest, on="Code", how="left")
+    prices_df = prices_df.rename(columns={"C": "Price"})
 
-    # PER = 株価/EPS, PBR = 株価/BPS, ROE = EPS/BPS * 100
+    df = df.merge(prices_df[["Code", "Price"]], on="Code", how="left")
+
     df["PER"] = df["Price"] / df["EPS"]
     df["PBR"] = df["Price"] / df["BPS"]
     df["ROE"] = df["EPS"] / df["BPS"] * 100
-
-    # 成長率はFSales/FOP（会社予想）で代替（無料プランでは前年実績が取りにくいため）
-    df["Sales_growth"] = (df["FSales"] - df["Sales"]) / df["Sales"].abs() * 100
-    df["OP_growth"] = (df["FOP"] - df["OP"]) / df["OP"].abs() * 100
 
     result = df[
         (df["PER"].notna()) & (df["PER"] > 0) & (df["PER"] <= PER_MAX) &
@@ -82,8 +138,7 @@ def notify(df):
 
 
 def main():
-    client = get_client()
-    result = screen(client)
+    result = screen()
     notify(result)
     print(f"該当銘柄数: {len(result)}")
     print(result.to_string())
