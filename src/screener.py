@@ -150,7 +150,7 @@ def notify(df):
     requests.post(
         f"https://ntfy.sh/{NTFY_TOPIC}",
         data=body.encode("utf-8"),
-        headers={"Title": "株スクリーニング結果", "Priority": "default"},
+        headers={"Title": "Stock Screener", "Priority": "default"},
     )
 
 
