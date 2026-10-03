@@ -49,8 +49,7 @@ stock-screener/
 ## GitHub Secrets（要設定）
 | キー | 内容 |
 |---|---|
-| `JQUANTS_EMAIL` | J-Quantsアカウントのメールアドレス |
-| `JQUANTS_PASSWORD` | J-Quantsアカウントのパスワード |
+| `JQUANTS_API_KEY` | J-Quants V2 APIキー |
 | `NTFY_TOPIC` | ntfy.shのトピック名 |
 
 ## スクリーニング条件
