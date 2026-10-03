@@ -2,12 +2,20 @@ name: Stock Screener
 
 on:
   schedule:
-    - cron: '0 1 * * 1-5'  # 平日10:00 JST（UTC+9）
+    - cron: '17 1 * * 1-5'  # 平日10:17 JST（UTC+9）
   workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: stock-screener
+  cancel-in-progress: false
 
 jobs:
   screen:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
@@ -18,6 +26,9 @@ jobs:
 
       - name: Install dependencies
         run: pip install -r requirements.txt
+
+      - name: Regression tests
+        run: python -m unittest discover -s tests -v
 
       - name: Run screener
         env:

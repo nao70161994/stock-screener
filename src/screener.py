@@ -1,13 +1,19 @@
 import os
 import time
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 import pandas as pd
 import requests
 
-NTFY_TOPIC = os.environ["NTFY_TOPIC"]
-API_KEY = os.environ["JQUANTS_API_KEY"]
 BASE_URL = "https://api.jquants.com/v2"
-HEADERS = {"x-api-key": API_KEY}
+
+
+def required_env(name):
+    value = os.environ.get(name, "").strip()
+    if not value:
+        raise RuntimeError(f"Required environment variable is missing: {name}")
+    return value
+
 
 PER_MAX = 20.0
 PBR_MAX = 3.0
@@ -18,26 +24,74 @@ OP_PROFIT_GROWTH_MIN = 10.0
 RATE_LIMIT_SLEEP = 13  # 5 req/min = 12s間隔、余裕を持って13s
 
 
+# A single limiter covers pages, endpoints and retries.
+_last_request_at = None
+MAX_ATTEMPTS = 3
+
+
 def jquants_get(path, params=None):
-    """J-Quants API へのGETリクエスト（ページネーション対応）"""
-    frames = []
+    """Fetch complete V2 data; never treat an API failure as an empty day."""
+    global _last_request_at
+    headers = {"x-api-key": required_env("JQUANTS_API_KEY")}
+    params = dict(params or {})
+    frames, seen_keys = [], set()
     while True:
-        resp = requests.get(f"{BASE_URL}{path}", headers=HEADERS, params=params, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
-
-        key = next((k for k in data if isinstance(data[k], list)), None)
-        if key is None:
+        for attempt in range(MAX_ATTEMPTS):
+            if _last_request_at is not None:
+                time.sleep(max(0, RATE_LIMIT_SLEEP - (time.monotonic() - _last_request_at)))
+            _last_request_at = time.monotonic()
+            try:
+                resp = requests.get(f"{BASE_URL}{path}", headers=headers, params=params, timeout=30)
+            except (requests.Timeout, requests.ConnectionError):
+                if attempt == MAX_ATTEMPTS - 1:
+                    raise RuntimeError(f"J-Quants transport failure: {path}") from None
+                time.sleep(2 ** attempt)
+                continue
+            if resp.status_code == 429 or 500 <= resp.status_code < 600:
+                if attempt < MAX_ATTEMPTS - 1:
+                    # Official 429 guidance: wait at least one minute, two to be certain.
+                    time.sleep(120 if resp.status_code == 429 else 2 ** attempt)
+                    continue
+            if resp.status_code >= 400:
+                # Do not include response bodies or credentials in Actions logs.
+                raise RuntimeError(f"J-Quants HTTP {resp.status_code}: {path}")
             break
-        frames.append(pd.DataFrame(data[key]))
-
+        try:
+            data = resp.json()
+        except ValueError:
+            raise RuntimeError(f"Invalid J-Quants JSON: {path}") from None
+        if not isinstance(data, dict) or not isinstance(data.get("data"), list):
+            raise RuntimeError(f"Invalid J-Quants data envelope: {path}")
+        if any(not isinstance(row, dict) for row in data["data"]):
+            raise RuntimeError(f"Invalid J-Quants record: {path}")
+        frames.append(pd.DataFrame(data["data"]))
         pagination_key = data.get("pagination_key")
         if not pagination_key:
             break
-        params = {**(params or {}), "pagination_key": pagination_key}
-        time.sleep(RATE_LIMIT_SLEEP)
-
+        if not isinstance(pagination_key, str) or pagination_key in seen_keys:
+            raise RuntimeError(f"Invalid J-Quants pagination: {path}")
+        seen_keys.add(pagination_key)
+        params["pagination_key"] = pagination_key
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
+def require_columns(df, columns, source):
+    missing = set(columns) - set(df.columns)
+    if missing:
+        raise RuntimeError(f"{source}: missing columns {sorted(missing)}")
+
+
+def latest_financials(df):
+    columns = ["Code", "DiscDate", "Sales", "OP", "EPS", "BPS"]
+    if df.empty:
+        return pd.DataFrame(columns=columns)
+    require_columns(df, columns, "financial summary")
+    df = df.copy()
+    for col in ["Sales", "OP", "EPS", "BPS"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    order = [c for c in ["DiscDate", "DiscTime", "DiscNo"] if c in df.columns]
+    # Keep a whole disclosure, rather than combining non-null values from different documents.
+    return df.sort_values(order, kind="stable").drop_duplicates("Code", keep="last")
 
 
 def fetch_fin_summary_window(end_dt, days=30):
@@ -47,20 +101,16 @@ def fetch_fin_summary_window(end_dt, days=30):
         dt = end_dt - timedelta(days=i)
         if dt.weekday() >= 5:
             continue
-        try:
-            df = jquants_get("/fins/summary", {"date": dt.strftime("%Y%m%d")})
-            if not df.empty:
-                frames.append(df)
-                print(f"  {dt.strftime('%Y%m%d')}: {len(df)}件")
-        except Exception as e:
-            print(f"  {dt.strftime('%Y%m%d')}: {e}")
-        time.sleep(RATE_LIMIT_SLEEP)
+        df = jquants_get("/fins/summary", {"date": dt.strftime("%Y%m%d")})
+        if not df.empty:
+            frames.append(df)
+            print(f"  {dt.strftime('%Y%m%d')}: {len(df)}件")
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
 def screen():
     # 無料プランは約90日遅延
-    end_dt = datetime.now() - timedelta(days=90)
+    end_dt = datetime.now(ZoneInfo("Asia/Tokyo")) - timedelta(days=90)
     year_ago_end = end_dt - timedelta(days=365)
 
     print("=== 現在期間の財務サマリー取得 ===")
@@ -74,14 +124,10 @@ def screen():
     if fins_now.empty:
         raise RuntimeError("財務サマリーを取得できませんでした")
 
-    for col in ["Sales", "OP", "EPS", "BPS"]:
-        fins_now[col] = pd.to_numeric(fins_now[col], errors="coerce")
-        if not fins_prev.empty:
-            fins_prev[col] = pd.to_numeric(fins_prev[col], errors="coerce")
-
-    fins_now = fins_now.sort_values("DiscDate").groupby("Code").last().reset_index()
-    if not fins_prev.empty:
-        fins_prev = fins_prev.sort_values("DiscDate").groupby("Code").last().reset_index()
+    if fins_prev.empty:
+        raise RuntimeError("前年同期データが空のため成長率を判定できません")
+    fins_now = latest_financials(fins_now)
+    fins_prev = latest_financials(fins_prev)
 
     fins_now = fins_now.rename(columns={"Sales": "Sales_now", "OP": "OP_now"})
     fins_prev = fins_prev.rename(columns={"Sales": "Sales_prev", "OP": "OP_prev"})
@@ -91,8 +137,8 @@ def screen():
         on="Code", how="left"
     )
 
-    df["Sales_growth"] = (df["Sales_now"] - df["Sales_prev"]) / df["Sales_prev"].abs() * 100
-    df["OP_growth"] = (df["OP_now"] - df["OP_prev"]) / df["OP_prev"].abs() * 100
+    df["Sales_growth"] = (df["Sales_now"] - df["Sales_prev"]) / df["Sales_prev"].abs().where(df["Sales_prev"] != 0) * 100
+    df["OP_growth"] = (df["OP_now"] - df["OP_prev"]) / df["OP_prev"].abs().where(df["OP_prev"] != 0) * 100
 
     # 株価取得：最後に成功した日付から直近の営業日を探す
     print("=== 株価取得 ===")
@@ -101,19 +147,17 @@ def screen():
         dt = end_dt - timedelta(days=i)
         if dt.weekday() >= 5:
             continue
-        try:
-            tmp = jquants_get("/equities/bars/daily", {"date": dt.strftime("%Y%m%d")})
-            if not tmp.empty:
-                prices_df = tmp
-                print(f"  株価取得日: {dt.strftime('%Y%m%d')} ({len(prices_df)}件)")
-                break
-            print(f"  {dt.strftime('%Y%m%d')}: 空レスポンス")
-        except Exception as e:
-            print(f"  {dt.strftime('%Y%m%d')}: {e}")
-        time.sleep(RATE_LIMIT_SLEEP)  # breakした場合はここに来ない
+        tmp = jquants_get("/equities/bars/daily", {"date": dt.strftime("%Y%m%d")})
+        if not tmp.empty:
+            prices_df = tmp
+            price_date = dt.strftime("%Y%m%d")
+            print(f"  株価取得日: {price_date} ({len(prices_df)}件)")
+            break
+        print(f"  {dt.strftime('%Y%m%d')}: 空レスポンス")
     if prices_df.empty:
         raise RuntimeError("株価データを取得できませんでした")
 
+    require_columns(prices_df, ["Code", "C"], "daily prices")
     prices_df = prices_df.rename(columns={"C": "Price"})
     prices_df["Price"] = pd.to_numeric(prices_df["Price"], errors="coerce")
 
@@ -121,16 +165,12 @@ def screen():
 
     # 会社名取得
     print("=== 会社情報取得 ===")
-    time.sleep(RATE_LIMIT_SLEEP)
-    info_df = jquants_get("/listed/info")
-    if not info_df.empty:
-        name_col = next((c for c in info_df.columns if "Name" in c and "English" not in c), None)
-        if name_col:
-            df = df.merge(info_df[["Code", name_col]].rename(columns={name_col: "CompanyName"}), on="Code", how="left")
-        else:
-            df["CompanyName"] = ""
-    else:
-        df["CompanyName"] = ""
+    info_df = jquants_get("/equities/master", {"date": price_date})
+    if info_df.empty:
+        raise RuntimeError("会社情報データを取得できませんでした")
+    require_columns(info_df, ["Code", "CoName"], "listed issue master")
+    df = df.merge(info_df[["Code", "CoName"]].rename(columns={"CoName": "CompanyName"}), on="Code", how="left")
+    df["CompanyName"] = df["CompanyName"].fillna("")
 
     df["PER"] = df["Price"] / df["EPS"]
     df["PBR"] = df["Price"] / df["BPS"]
@@ -162,14 +202,19 @@ def notify(df):
             )
         body = "\n".join(lines)
 
-    requests.post(
-        f"https://ntfy.sh/{NTFY_TOPIC}",
+    response = requests.post(
+        f"https://ntfy.sh/{required_env('NTFY_TOPIC')}",
         data=body.encode("utf-8"),
         headers={"Title": "Stock Screener", "Priority": "default"},
+        timeout=30,
     )
+    if response.status_code >= 400:
+        raise RuntimeError(f"ntfy HTTP {response.status_code}")
 
 
 def main():
+    required_env("JQUANTS_API_KEY")
+    required_env("NTFY_TOPIC")
     result = screen()
     notify(result)
     print(f"該当銘柄数: {len(result)}")
