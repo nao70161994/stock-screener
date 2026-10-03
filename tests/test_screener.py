@@ -14,8 +14,11 @@ def response(data=None, status=200):
     return r
 
 
-def financial(code="12340", sales="120", op="24", eps="10", bps="50"):
-    return {"Code": code, "DiscDate": "2026-06-01", "DiscTime": "15:00:00",
+def financial(code="12340", sales="120", op="24", eps="10", bps="50", year=2026):
+    return {"Code": code, "DiscDate": f"{year}-06-01",
+            "DocType": "FYFinancialStatements_Consolidated_JP", "CurPerType": "FY",
+            "CurPerSt": f"{year-1}-04-01", "CurPerEn": f"{year}-03-31",
+            "CurFYSt": f"{year-1}-04-01", "CurFYEn": f"{year}-03-31", "DiscTime": "15:00:00",
             "DiscNo": "1", "Sales": sales, "OP": op, "EPS": eps, "BPS": bps}
 
 
@@ -111,12 +114,13 @@ class APITests(unittest.TestCase):
 
 
 class ScreeningTests(unittest.TestCase):
-    def run_screen(self, now=None, prev=None, prices=None, info=None):
+    def run_screen(self, now=None, prev=None, prices=None, info=None, valuation=None):
         now = pd.DataFrame([financial()]) if now is None else now
-        prev = pd.DataFrame([financial(sales="100", op="20")]) if prev is None else prev
+        prev = pd.DataFrame([financial(sales="100", op="20", year=2025)]) if prev is None else prev
         prices = pd.DataFrame([{"Code": "12340", "C": "100"}]) if prices is None else prices
         info = pd.DataFrame([{"Code": "12340", "CoName": "会社", "CoNameEn": "Company"}]) if info is None else info
-        with patch.object(s, "fetch_fin_summary_window", side_effect=[now, prev]), patch.object(s, "jquants_get", side_effect=[prices, info]) as get:
+        valuation = pd.DataFrame([{ "Code": "12340", "PER": 10, "PBR": 2, "ROE": 0.2}]) if valuation is None else valuation
+        with patch.object(s, "fetch_fin_summary_window", side_effect=[now, prev]), patch.object(s, "jquants_get", side_effect=[prices, info, valuation]) as get:
             result = s.screen()
         return result, get
 
@@ -141,15 +145,15 @@ class ScreeningTests(unittest.TestCase):
     def test_zero_or_missing_comparison_is_excluded(self):
         for value in ["0", "", None]:
             with self.subTest(value=value):
-                result, _ = self.run_screen(prev=pd.DataFrame([financial(sales=value, op=value)]))
+                result, _ = self.run_screen(prev=pd.DataFrame([financial(sales=value, op=value, year=2025)]))
                 self.assertTrue(result.empty)
 
     def test_unmatched_code_is_excluded(self):
-        result, _ = self.run_screen(prev=pd.DataFrame([financial(code="56780")]))
+        result, _ = self.run_screen(prev=pd.DataFrame([financial(code="56780", year=2025)]))
         self.assertTrue(result.empty)
 
     def test_missing_numeric_fields_are_excluded(self):
-        result, _ = self.run_screen(now=pd.DataFrame([financial(eps="", bps="")]))
+        result, _ = self.run_screen(valuation=pd.DataFrame([{"Code": "12340", "PER": None, "PBR": None, "ROE": None}]))
         self.assertTrue(result.empty)
 
     def test_empty_master_is_failure(self):
@@ -164,9 +168,9 @@ class ScreeningTests(unittest.TestCase):
                 self.run_screen(**kwargs)
 
     def test_price_fallback_only_on_valid_empty_day(self):
-        with patch.object(s, "fetch_fin_summary_window", side_effect=[pd.DataFrame([financial()]), pd.DataFrame([financial(sales="100", op="20")])]), patch.object(s, "jquants_get", side_effect=[pd.DataFrame(), pd.DataFrame([{"Code": "12340", "C": "100"}]), pd.DataFrame([{"Code": "12340", "CoName": "会社"}])]) as get:
+        with patch.object(s, "fetch_fin_summary_window", side_effect=[pd.DataFrame([financial()]), pd.DataFrame([financial(sales="100", op="20", year=2025)])]), patch.object(s, "jquants_get", side_effect=[pd.DataFrame(), pd.DataFrame([{"Code": "12340", "C": "100"}]), pd.DataFrame([{"Code": "12340", "CoName": "会社"}]), pd.DataFrame([{"Code": "12340", "PER": 10, "PBR": 2, "ROE": 0.2}])]) as get:
             self.assertEqual(len(s.screen()), 1)
-            self.assertEqual(get.call_count, 3)
+            self.assertEqual(get.call_count, 4)
 
     def test_no_prices_is_failure(self):
         with patch.object(s, "fetch_fin_summary_window", side_effect=[pd.DataFrame([financial()]), pd.DataFrame([financial()])]), patch.object(s, "jquants_get", return_value=pd.DataFrame()):
@@ -178,8 +182,104 @@ class ScreeningTests(unittest.TestCase):
         new = financial(eps="")
         new.update(DiscTime="16:00:00", DiscNo="2")
         df = s.latest_financials(pd.DataFrame([new, old]))
-        self.assertTrue(pd.isna(df.iloc[0].EPS))
+        self.assertEqual(df.iloc[0].EPS, "")
         self.assertEqual(df.iloc[0].DiscNo, "2")
+
+
+class ComparisonRegressionTests(unittest.TestCase):
+    def test_dividend_and_forecast_revision_do_not_replace_statement(self):
+        for doc_type in ["DividendForecastRevision", "EarnForecastRevision"]:
+            with self.subTest(doc_type=doc_type):
+                actual = financial()
+                revision = financial(sales="", op="", eps="", bps="")
+                revision.update(DocType=doc_type, DiscTime="16:00:00", DiscNo="2")
+                result, _ = ScreeningTests().run_screen(now=pd.DataFrame([actual, revision]))
+                self.assertEqual(len(result), 1)
+                self.assertEqual(result.iloc[0].Sales_growth, 20)
+
+    def test_period_and_accounting_mismatches_are_excluded(self):
+        for changed in [{"CurPerType": "3Q"}, {"CurPerEn": "2024-12-31"},
+                        {"CurPerSt": "2024-07-01"}, {"CurFYEn": "2025-06-30"},
+                        {"CurFYSt": "2024-07-01"},
+                        {"DocType": "FYFinancialStatements_NonConsolidated_JP"},
+                        {"DocType": "FYFinancialStatements_Consolidated_IFRS"},
+                        {"CurFYEn": ""}, {"CurPerEn": "invalid"}]:
+            previous = financial(sales="100", op="20", year=2025)
+            previous.update(changed)
+            with self.subTest(changed=changed):
+                result, _ = ScreeningTests().run_screen(prev=pd.DataFrame([previous]))
+                self.assertTrue(result.empty)
+
+    def test_previous_matching_statement_survives_other_period(self):
+        matched = financial(sales="100", op="20", year=2025)
+        other = financial(sales="1", op="1", year=2025)
+        other.update(CurPerType="3Q", CurPerEn="2024-12-31", DiscNo="2", DiscTime="16:00:00")
+        result, _ = ScreeningTests().run_screen(prev=pd.DataFrame([matched, other]))
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result.iloc[0].Sales_growth, 20)
+
+    def test_correcting_statement_is_used_without_backfilling_blanks(self):
+        old = financial()
+        corrected = financial(sales="", op="")
+        corrected.update(DiscNo="2", DiscTime="16:00:00")
+        result, _ = ScreeningTests().run_screen(now=pd.DataFrame([old, corrected]))
+        self.assertTrue(result.empty)
+
+    def test_previous_correcting_statement_is_used(self):
+        old = financial(sales="100", op="20", year=2025)
+        corrected = financial(sales="110", op="22", year=2025)
+        corrected.update(DiscNo="2", DiscTime="16:00:00")
+        df = s.compare_financials(pd.DataFrame([financial()]), pd.DataFrame([corrected, old]))
+        self.assertEqual(df.iloc[0].Sales_prev, 110)
+
+    def test_leap_year_period_matching(self):
+        current = financial()
+        current.update(CurPerSt="2023-03-01", CurPerEn="2024-02-29", CurFYSt="2023-03-01", CurFYEn="2024-02-29")
+        previous = financial(sales="100", op="20", year=2025)
+        previous.update(CurPerSt="2022-03-01", CurPerEn="2023-02-28", CurFYSt="2022-03-01", CurFYEn="2023-02-28")
+        df = s.compare_financials(pd.DataFrame([current]), pd.DataFrame([previous]))
+        self.assertEqual(df.iloc[0].Sales_growth, 20)
+
+    def test_revision_only_windows_produce_no_candidates(self):
+        revision = financial()
+        revision["DocType"] = "DividendForecastRevision"
+        for side in ["now", "prev"]:
+            with self.subTest(side=side):
+                result, _ = ScreeningTests().run_screen(**{side: pd.DataFrame([revision])})
+                self.assertTrue(result.empty)
+
+    def test_missing_period_schema_is_not_silently_accepted(self):
+        df = pd.DataFrame([financial()]).drop(columns=["CurPerType"])
+        with self.assertRaisesRegex(RuntimeError, "missing columns"):
+            s.compare_financials(df, pd.DataFrame([financial(year=2025)]))
+
+    def test_official_valuation_ignores_quarter_eps_and_summary_roe(self):
+        actual = financial(eps="0.01", bps="1")
+        actual["ROE"] = "0.001"
+        result, get = ScreeningTests().run_screen(now=pd.DataFrame([actual]))
+        self.assertEqual(len(result), 1)
+        row = result.iloc[0]
+        self.assertEqual((row.PER, row.PBR, row.ROE), (10, 2, 20))
+        self.assertEqual(get.call_args.args[0], "/equities/valuation")
+        self.assertEqual(get.call_args.args[1], get.call_args_list[0].args[1])
+
+    def test_unavailable_or_nonfinite_valuations_are_excluded(self):
+        for value in [None, "", "bad", float("inf"), -float("inf")]:
+            with self.subTest(value=value):
+                valuation = pd.DataFrame([{"Code": "12340", "PER": value, "PBR": value, "ROE": value}])
+                result, _ = ScreeningTests().run_screen(valuation=valuation)
+                self.assertTrue(result.empty)
+
+    def test_empty_valuation_or_wrong_schema_fails(self):
+        for frame, message in [(pd.DataFrame(), "バリュエーション"),
+                               (pd.DataFrame([{"Code": "12340"}]), "missing columns")]:
+            with self.subTest(message=message), self.assertRaisesRegex(RuntimeError, message):
+                ScreeningTests().run_screen(valuation=frame)
+
+    def test_valuation_api_failure_propagates(self):
+        with patch.object(s, "fetch_fin_summary_window", side_effect=[pd.DataFrame([financial()]), pd.DataFrame([financial(sales="100", op="20", year=2025)])]), patch.object(s, "jquants_get", side_effect=[pd.DataFrame([{"Code": "12340", "C": "100"}]), pd.DataFrame([{"Code": "12340", "CoName": "会社"}]), RuntimeError("HTTP 403")]):
+            with self.assertRaisesRegex(RuntimeError, "403"):
+                s.screen()
 
 
 class NotificationTests(unittest.TestCase):
