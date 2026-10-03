@@ -81,17 +81,49 @@ def require_columns(df, columns, source):
         raise RuntimeError(f"{source}: missing columns {sorted(missing)}")
 
 
-def latest_financials(df):
-    columns = ["Code", "DiscDate", "Sales", "OP", "EPS", "BPS"]
+PERIOD_COLUMNS = ["DocType", "CurPerType", "CurPerSt", "CurPerEn", "CurFYSt", "CurFYEn"]
+DATE_COLUMNS = ["CurPerSt", "CurPerEn", "CurFYSt", "CurFYEn"]
+
+
+def financial_statements(df):
+    """Keep actual statements; revisions of forecasts/dividends are separate documents."""
+    columns = ["Code", "DiscDate", "Sales", "OP", *PERIOD_COLUMNS]
     if df.empty:
         return pd.DataFrame(columns=columns)
     require_columns(df, columns, "financial summary")
     df = df.copy()
-    for col in ["Sales", "OP", "EPS", "BPS"]:
+    df = df[df["DocType"].fillna("").str.contains("FinancialStatements", regex=False)]
+    for col in DATE_COLUMNS:
+        df[col] = pd.to_datetime(df[col], errors="coerce")
+    df = df.dropna(subset=["Code", *DATE_COLUMNS])
+    df = df[(df["Code"] != "") & df["CurPerType"].isin(["1Q", "2Q", "3Q", "4Q", "5Q", "FY"])]
+    df = df[(df["CurPerEn"] >= df["CurPerSt"]) & (df["CurFYEn"] >= df["CurFYSt"])]
+    for col in ["Sales", "OP"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
     order = [c for c in ["DiscDate", "DiscTime", "DiscNo"] if c in df.columns]
-    # Keep a whole disclosure, rather than combining non-null values from different documents.
-    return df.sort_values(order, kind="stable").drop_duplicates("Code", keep="last")
+    return df.sort_values(order, kind="stable")
+
+
+def latest_financials(df):
+    # Select a whole statement, including blank values in correcting statements.
+    return financial_statements(df).drop_duplicates("Code", keep="last")
+
+
+def compare_financials(current, previous):
+    current = latest_financials(current)
+    previous = financial_statements(previous).drop_duplicates(["Code", *PERIOD_COLUMNS], keep="last")
+    # Match accounting basis, consolidation, quarter, and exact fiscal/period dates.
+    # Calendar-year offsets handle leap years; changed fiscal years are excluded.
+    keys = ["Code", *PERIOD_COLUMNS]
+    current = current.rename(columns={"Sales": "Sales_now", "OP": "OP_now"})
+    for col in DATE_COLUMNS:
+        current[col] = current[col] - pd.DateOffset(years=1)
+    previous = previous.rename(columns={"Sales": "Sales_prev", "OP": "OP_prev"})
+    df = current.merge(previous[[*keys, "Sales_prev", "OP_prev"]], on=keys, how="left", validate="many_to_one")
+    for field, output in [("Sales", "Sales_growth"), ("OP", "OP_growth")]:
+        denominator = df[f"{field}_prev"].abs().where(df[f"{field}_prev"] != 0)
+        df[output] = (df[f"{field}_now"] - df[f"{field}_prev"]) / denominator * 100
+    return df
 
 
 def fetch_fin_summary_window(end_dt, days=30):
@@ -111,7 +143,7 @@ def fetch_fin_summary_window(end_dt, days=30):
 def screen():
     # 無料プランは約90日遅延
     end_dt = datetime.now(ZoneInfo("Asia/Tokyo")) - timedelta(days=90)
-    year_ago_end = end_dt - timedelta(days=365)
+    year_ago_end = end_dt - pd.DateOffset(years=1)
 
     print("=== 現在期間の財務サマリー取得 ===")
     fins_now = fetch_fin_summary_window(end_dt, days=30)
@@ -126,19 +158,7 @@ def screen():
 
     if fins_prev.empty:
         raise RuntimeError("前年同期データが空のため成長率を判定できません")
-    fins_now = latest_financials(fins_now)
-    fins_prev = latest_financials(fins_prev)
-
-    fins_now = fins_now.rename(columns={"Sales": "Sales_now", "OP": "OP_now"})
-    fins_prev = fins_prev.rename(columns={"Sales": "Sales_prev", "OP": "OP_prev"})
-
-    df = fins_now.merge(
-        fins_prev[["Code", "Sales_prev", "OP_prev"]],
-        on="Code", how="left"
-    )
-
-    df["Sales_growth"] = (df["Sales_now"] - df["Sales_prev"]) / df["Sales_prev"].abs().where(df["Sales_prev"] != 0) * 100
-    df["OP_growth"] = (df["OP_now"] - df["OP_prev"]) / df["OP_prev"].abs().where(df["OP_prev"] != 0) * 100
+    df = compare_financials(fins_now, fins_prev)
 
     # 株価取得：最後に成功した日付から直近の営業日を探す
     print("=== 株価取得 ===")
@@ -172,9 +192,19 @@ def screen():
     df = df.merge(info_df[["Code", "CoName"]].rename(columns={"CoName": "CompanyName"}), on="Code", how="left")
     df["CompanyName"] = df["CompanyName"].fillna("")
 
-    df["PER"] = df["Price"] / df["EPS"]
-    df["PBR"] = df["Price"] / df["BPS"]
-    df["ROE"] = df["EPS"] / df["BPS"] * 100
+    # Official actual valuations use TTM income and average shareholders' equity.
+    valuation = jquants_get("/equities/valuation", {"date": price_date})
+    if valuation.empty:
+        raise RuntimeError("バリュエーション指標を取得できませんでした")
+    require_columns(valuation, ["Code", "PER", "PBR", "ROE"], "valuation indicators")
+    valuation = valuation[["Code", "PER", "PBR", "ROE"]].copy()
+    for col in ["PER", "PBR", "ROE"]:
+        valuation[col] = pd.to_numeric(valuation[col], errors="coerce")
+        valuation[col] = valuation[col].replace([float("inf"), -float("inf")], float("nan"))
+    valuation["ROE"] *= 100  # API decimals -> displayed/filter percentages.
+    # Statement ROE (if present) must not shadow the authoritative valuation.
+    df = df.drop(columns=["PER", "PBR", "ROE"], errors="ignore")
+    df = df.merge(valuation, on="Code", how="left", validate="many_to_one")
 
     result = df[
         (df["PER"].notna()) & (df["PER"] > 0) & (df["PER"] <= PER_MAX) &
